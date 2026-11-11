@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Usage: ./setup-ollama.sh llama3.2
+# Usage: ./setup-ollama.sh <model-name>
 
 if [[ $# -ne 1 ]]; then
     echo "Usage: $0 <model-name>"
@@ -10,6 +10,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 MODEL="$1"
+API_KEY="sk-ollama-$(python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null || echo "$RANDOM$RANDOM")"
 
 # Check dependencies
 for cmd in curl grep; do
@@ -162,20 +163,131 @@ if ! command -v cloudflared >/dev/null 2>&1; then
     $SUDO chmod +x /usr/local/bin/cloudflared
 fi
 
-echo "[5/5] Starting Cloudflare Tunnel..."
+echo "[5/5] Starting Auth Proxy & Cloudflare Tunnel..."
 
+pkill -f "ollama_proxy.py" 2>/dev/null || true
 pkill -x cloudflared 2>/dev/null || true
+
+PROXY_SCRIPT="/tmp/ollama_proxy.py"
+cat <<'EOF' > "$PROXY_SCRIPT"
+import sys, http.server, socketserver, urllib.request, urllib.error, urllib.parse
+
+PORT = int(sys.argv[1])
+TARGET_PORT = int(sys.argv[2])
+EXPECTED_KEY = sys.argv[3]
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+class AuthProxyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, format, *args):
+        pass
+
+    def check_auth(self):
+        auth_header = self.headers.get('Authorization', '')
+        x_api_key = self.headers.get('x-api-key', '')
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        q_key = qs.get('api_key', [None])[0]
+
+        token = None
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:].strip()
+        elif x_api_key:
+            token = x_api_key.strip()
+        elif q_key:
+            token = q_key.strip()
+
+        return token == EXPECTED_KEY
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type, x-api-key')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    def proxy(self):
+        if not self.check_auth():
+            self.send_response(401)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            msg = b'{"error": "Unauthorized: Invalid or missing API key"}\n'
+            self.send_header('Content-Length', str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+            return
+
+        target_url = f"http://127.0.0.1:{TARGET_PORT}{self.path}"
+        content_len = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_len) if content_len > 0 else None
+
+        req_headers = {}
+        for k, v in self.headers.items():
+            if k.lower() not in ('host', 'content-length', 'transfer-encoding', 'connection'):
+                req_headers[k] = v
+
+        req = urllib.request.Request(target_url, data=body, headers=req_headers, method=self.command)
+
+        try:
+            with urllib.request.urlopen(req) as resp:
+                self.send_response(resp.status)
+                for h, val in resp.getheaders():
+                    if h.lower() not in ('transfer-encoding', 'connection'):
+                        self.send_header(h, val)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+        except urllib.error.HTTPError as e:
+            self.send_response(e.code)
+            for h, val in e.headers.items():
+                if h.lower() not in ('transfer-encoding', 'connection'):
+                    self.send_header(h, val)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(e.read())
+            self.wfile.flush()
+        except Exception as e:
+            self.send_response(502)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(f'{{"error": "Proxy error: {str(e)}"}}\n'.encode('utf-8'))
+
+    do_GET = proxy
+    do_POST = proxy
+    do_PUT = proxy
+    do_DELETE = proxy
+    do_HEAD = proxy
+
+with ThreadedHTTPServer(('127.0.0.1', PORT), AuthProxyHandler) as httpd:
+    httpd.serve_forever()
+EOF
+
+python3 "$PROXY_SCRIPT" 11435 11434 "$API_KEY" >/tmp/proxy.log 2>&1 &
+PROXY_PID=$!
 
 LOG_FILE="$(mktemp)"
 cloudflared tunnel --no-autoupdate \
-    --http-host-header="localhost:11434" \
-    --url http://127.0.0.1:11434 >"$LOG_FILE" 2>&1 &
+    --http-host-header="localhost:11435" \
+    --url http://127.0.0.1:11435 >"$LOG_FILE" 2>&1 &
 
 TUNNEL_PID=$!
 
 cleanup() {
     kill "$TUNNEL_PID" 2>/dev/null || true
-    rm -f "$LOG_FILE"
+    kill "$PROXY_PID" 2>/dev/null || true
+    pkill -f "ollama_proxy.py" 2>/dev/null || true
+    rm -f "$LOG_FILE" "$PROXY_SCRIPT"
 }
 trap cleanup EXIT INT TERM
 
@@ -205,15 +317,28 @@ if [[ -z "$PUBLIC_URL" ]]; then
 fi
 
 echo
-echo "========================================"
-echo " Ollama is running!"
-echo "========================================"
-echo " Model:      $MODEL"
-echo " Public URL: $PUBLIC_URL"
-echo " API:        $PUBLIC_URL/api"
-echo "========================================"
+echo "=========================================================="
+echo " Ollama is SECURED with API Key & running!"
+echo "=========================================================="
+echo " Model:       $MODEL"
+echo " Public URL:  $PUBLIC_URL"
+echo " API Key:     $API_KEY"
+echo "=========================================================="
+echo " How to use your API Key:"
+echo
+echo " 1) Browser / Quick check:"
+echo "    $PUBLIC_URL/?api_key=$API_KEY"
+echo
+echo " 2) cURL (Ollama API):"
+echo "    curl -H \"Authorization: Bearer $API_KEY\" \\"
+echo "         $PUBLIC_URL/api/tags"
+echo
+echo " 3) Python (OpenAI SDK / LangChain / Open WebUI):"
+echo "    base_url = \"$PUBLIC_URL/v1\""
+echo "    api_key  = \"$API_KEY\""
+echo "=========================================================="
 echo
 echo "Keep this script running to keep the tunnel alive."
-echo "Press Ctrl+C to stop the tunnel."
+echo "Press Ctrl+C to stop."
 
 wait "$TUNNEL_PID"
