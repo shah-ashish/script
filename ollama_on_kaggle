@@ -24,17 +24,21 @@ if [[ $EUID -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
 fi
 
-# Ensure zstd is installed (required by Ollama installer)
-if ! command -v zstd >/dev/null 2>&1; then
-    echo "Installing zstd..."
+# Ensure zstd and pciutils (for GPU detection) are installed
+PKGS_TO_INSTALL=()
+command -v zstd >/dev/null 2>&1 || PKGS_TO_INSTALL+=("zstd")
+command -v lspci >/dev/null 2>&1 || PKGS_TO_INSTALL+=("pciutils")
+
+if [[ ${#PKGS_TO_INSTALL[@]} -gt 0 ]]; then
+    echo "Installing missing dependencies: ${PKGS_TO_INSTALL[*]}..."
     if command -v apt-get >/dev/null 2>&1; then
-        $SUDO apt-get update -y && $SUDO apt-get install -y zstd
+        $SUDO apt-get update -y && $SUDO apt-get install -y "${PKGS_TO_INSTALL[@]}"
     elif command -v dnf >/dev/null 2>&1; then
-        $SUDO dnf install -y zstd
+        $SUDO dnf install -y "${PKGS_TO_INSTALL[@]}"
     elif command -v pacman >/dev/null 2>&1; then
-        $SUDO pacman -Sy --noconfirm zstd
+        $SUDO pacman -Sy --noconfirm "${PKGS_TO_INSTALL[@]}"
     elif command -v apk >/dev/null 2>&1; then
-        apk add zstd
+        apk add "${PKGS_TO_INSTALL[@]}"
     fi
 fi
 
@@ -46,9 +50,20 @@ fi
 
 echo "[2/5] Starting Ollama..."
 
-if command -v systemctl >/dev/null 2>&1 &&
-   systemctl list-unit-files ollama.service --no-legend 2>/dev/null | grep -q ollama; then
-    $SUDO systemctl enable --now ollama
+START_VIA_SYSTEMD=false
+if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-system-running >/dev/null 2>&1 || [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ (running|degraded) ]]; then
+        START_VIA_SYSTEMD=true
+    fi
+fi
+
+if [[ "$START_VIA_SYSTEMD" == "true" ]] && systemctl list-unit-files ollama.service --no-legend 2>/dev/null | grep -q ollama; then
+    $SUDO systemctl enable --now ollama || {
+        echo "systemd service start failed, falling back to background process..."
+        if ! pgrep -x ollama >/dev/null; then
+            ollama serve >/tmp/ollama.log 2>&1 &
+        fi
+    }
 else
     if ! pgrep -x ollama >/dev/null; then
         ollama serve >/tmp/ollama.log 2>&1 &
@@ -64,7 +79,8 @@ for i in {1..60}; do
 done
 
 curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || {
-    echo "Ollama failed to start."
+    echo "Ollama failed to start. Service logs:"
+    cat /tmp/ollama.log 2>/dev/null || true
     exit 1
 }
 
