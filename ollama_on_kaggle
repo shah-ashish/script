@@ -50,6 +50,16 @@ fi
 
 echo "[2/5] Starting Ollama..."
 
+export OLLAMA_HOST="0.0.0.0:11434"
+export OLLAMA_ORIGINS="*"
+
+# If already running, restart to ensure environment variables are applied
+if pgrep -x ollama >/dev/null; then
+    echo "Restarting Ollama to apply remote access settings..."
+    pkill -x ollama 2>/dev/null || true
+    sleep 1
+fi
+
 START_VIA_SYSTEMD=false
 if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
     if systemctl is-system-running >/dev/null 2>&1 || [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ (running|degraded) ]]; then
@@ -86,7 +96,50 @@ curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || {
 
 echo "[3/5] Pulling model: $MODEL"
 
-ollama pull "$MODEL"
+if command -v python3 >/dev/null 2>&1; then
+    python3 - <<EOF "$MODEL"
+import sys, json, urllib.request
+
+model = sys.argv[1]
+url = "http://127.0.0.1:11434/api/pull"
+data = json.dumps({"name": model, "stream": True}).encode("utf-8")
+req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+
+try:
+    with urllib.request.urlopen(req) as resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8").strip()
+            if not line:
+                continue
+            val = json.loads(line)
+            if "error" in val:
+                sys.stderr.write(f"\nError: {val['error']}\n")
+                sys.exit(1)
+            status = val.get("status", "")
+            completed = val.get("completed", 0)
+            total = val.get("total", 0)
+            if total > 0:
+                pct = int((completed / total) * 100)
+                gb_done = completed / (1024**3)
+                gb_tot = total / (1024**3)
+                bar_len = 20
+                filled = int(bar_len * completed // total)
+                bar = "=" * filled + "-" * (bar_len - filled)
+                msg = f"\r[3/5] {status}: [{bar}] {pct}% ({gb_done:.2f}/{gb_tot:.2f} GB)"
+            else:
+                msg = f"\r[3/5] {status}"
+            sys.stdout.write(msg.ljust(80)[:80])
+            sys.stdout.flush()
+    print(f"\n[3/5] Successfully pulled {model}")
+except KeyboardInterrupt:
+    sys.exit(130)
+except Exception as e:
+    sys.stderr.write(f"\nFailed to pull model: {e}\n")
+    sys.exit(1)
+EOF
+else
+    ollama pull "$MODEL"
+fi
 
 echo "[4/5] Installing cloudflared..."
 
@@ -111,8 +164,11 @@ fi
 
 echo "[5/5] Starting Cloudflare Tunnel..."
 
+pkill -x cloudflared 2>/dev/null || true
+
 LOG_FILE="$(mktemp)"
 cloudflared tunnel --no-autoupdate \
+    --http-host-header="localhost:11434" \
     --url http://127.0.0.1:11434 >"$LOG_FILE" 2>&1 &
 
 TUNNEL_PID=$!
