@@ -19,6 +19,25 @@ for cmd in curl grep; do
     }
 done
 
+SUDO=""
+if [[ $EUID -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+fi
+
+# Ensure zstd is installed (required by Ollama installer)
+if ! command -v zstd >/dev/null 2>&1; then
+    echo "Installing zstd..."
+    if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update -y && $SUDO apt-get install -y zstd
+    elif command -v dnf >/dev/null 2>&1; then
+        $SUDO dnf install -y zstd
+    elif command -v pacman >/dev/null 2>&1; then
+        $SUDO pacman -Sy --noconfirm zstd
+    elif command -v apk >/dev/null 2>&1; then
+        apk add zstd
+    fi
+fi
+
 echo "[1/5] Installing Ollama..."
 
 if ! command -v ollama >/dev/null 2>&1; then
@@ -29,7 +48,7 @@ echo "[2/5] Starting Ollama..."
 
 if command -v systemctl >/dev/null 2>&1 &&
    systemctl list-unit-files ollama.service --no-legend 2>/dev/null | grep -q ollama; then
-    sudo systemctl enable --now ollama
+    $SUDO systemctl enable --now ollama
 else
     if ! pgrep -x ollama >/dev/null; then
         ollama serve >/tmp/ollama.log 2>&1 &
@@ -67,11 +86,11 @@ if ! command -v cloudflared >/dev/null 2>&1; then
             ;;
     esac
 
-    sudo curl -fL \
+    $SUDO curl -fL \
         "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" \
         -o /usr/local/bin/cloudflared
 
-    sudo chmod +x /usr/local/bin/cloudflared
+    $SUDO chmod +x /usr/local/bin/cloudflared
 fi
 
 echo "[5/5] Starting Cloudflare Tunnel..."
